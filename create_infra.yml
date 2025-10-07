@@ -6,7 +6,23 @@
   vars_files:
     - group_vars/all.yml
 
+  vars:
+    # Set to true if your DNS zone is hosted on DigitalOcean and you want A records created automatically.
+    manage_dns: false
+
   tasks:
+    - name: Sanity check required vars
+      ansible.builtin.assert:
+        that:
+          - do_token is defined
+          - region is defined
+          - image is defined
+          - ssh_key_id is defined
+        fail_msg: "Missing one of: do_token, region, image, ssh_key_id. Check group_vars/all.yml and env DO_TOKEN."
+
+    # -------------------------
+    # Create droplets
+    # -------------------------
     - name: Create Jenkins droplet
       community.digitalocean.digital_ocean_droplet:
         state: present
@@ -52,56 +68,174 @@
         tags: ["devops", "nexus"]
       register: nexus
 
-    - name: Add Jenkins host to in-memory inventory
+    # -------------------------
+    # Fetch droplet info (version-proof) and derive public IPs
+    # -------------------------
+    - name: Get Jenkins droplet info
+      community.digitalocean.digital_ocean_droplet_info:
+        oauth_token: "{{ do_token }}"
+        name: "{{ jenkins_name }}"
+      register: jenkins_info
+
+    - name: Get SonarQube droplet info
+      community.digitalocean.digital_ocean_droplet_info:
+        oauth_token: "{{ do_token }}"
+        name: "{{ sonarqube_name }}"
+      register: sonarqube_info
+
+    - name: Get Nexus droplet info
+      community.digitalocean.digital_ocean_droplet_info:
+        oauth_token: "{{ do_token }}"
+        name: "{{ nexus_name }}"
+      register: nexus_info
+
+    # Normalize objects (some versions use .data[], others .droplets[])
+    - name: Normalize droplet objects
+      set_fact:
+        jenkins_obj: >-
+          {{
+            (jenkins_info.data | default([]))
+            | selectattr('name','equalto', jenkins_name)
+            | list | first | default(
+              (jenkins_info.droplets | default([]))
+              | selectattr('name','equalto', jenkins_name)
+              | list | first
+            )
+          }}
+        sonarqube_obj: >-
+          {{
+            (sonarqube_info.data | default([]))
+            | selectattr('name','equalto', sonarqube_name)
+            | list | first | default(
+              (sonarqube_info.droplets | default([]))
+              | selectattr('name','equalto', sonarqube_name)
+              | list | first
+            )
+          }}
+        nexus_obj: >-
+          {{
+            (nexus_info.data | default([]))
+            | selectattr('name','equalto', nexus_name)
+            | list | first | default(
+              (nexus_info.droplets | default([]))
+              | selectattr('name','equalto', nexus_name)
+              | list | first
+            )
+          }}
+
+    - name: Compute public IPv4s
+      set_fact:
+        jenkins_ip: >-
+          {{ (jenkins_obj.networks.v4
+              | selectattr('type','equalto','public')
+              | map(attribute='ip_address')
+              | list | first) | default('') }}
+        sonarqube_ip: >-
+          {{ (sonarqube_obj.networks.v4
+              | selectattr('type','equalto','public')
+              | map(attribute='ip_address')
+              | list | first) | default('') }}
+        nexus_ip: >-
+          {{ (nexus_obj.networks.v4
+              | selectattr('type','equalto','public')
+              | map(attribute='ip_address')
+              | list | first) | default('') }}
+
+    - name: Validate we found public IPv4s
+      ansible.builtin.assert:
+        that:
+          - jenkins_ip | length > 0
+          - sonarqube_ip | length > 0
+          - nexus_ip | length > 0
+        fail_msg: "Could not determine one or more public IPs. Run with -vvv or add a debug to inspect *_info payloads."
+
+    - name: Show created IPs
+      debug:
+        msg:
+          jenkins: "{{ jenkins_ip }}"
+          sonarqube: "{{ sonarqube_ip }}"
+          nexus: "{{ nexus_ip }}"
+
+    # -------------------------
+    # Add hosts for subsequent plays
+    # -------------------------
+    - name: Add Jenkins host
       add_host:
         name: jenkins
-        ansible_host: "{{ jenkins.data.ip_address }}"
+        ansible_host: "{{ jenkins_ip }}"
         groups: jenkins_group,created
         service_name: jenkins
         service_port: 8080
         domain: "{{ domains.jenkins }}"
 
-    - name: Add SonarQube host to in-memory inventory
+    - name: Add SonarQube host
       add_host:
         name: sonarqube
-        ansible_host: "{{ sonarqube.data.ip_address }}"
+        ansible_host: "{{ sonarqube_ip }}"
         groups: sonarqube_group,created
         service_name: sonarqube
         service_port: 9000
         domain: "{{ domains.sonarqube }}"
 
-    - name: Add Nexus host to in-memory inventory
+    - name: Add Nexus host
       add_host:
         name: nexus
-        ansible_host: "{{ nexus.data.ip_address }}"
+        ansible_host: "{{ nexus_ip }}"
         groups: nexus_group,created
         service_name: nexus
         service_port: 8081
         domain: "{{ domains.nexus }}"
 
+# -----------------------------------------
+# Configure common packages on all servers
+# -----------------------------------------
 - name: Configure base packages (common) on all servers
   hosts: created
   become: true
+  gather_facts: true
+  tasks:
+    - name: Wait for SSH to be ready
+      ansible.builtin.wait_for:
+        host: "{{ ansible_host }}"
+        port: 22
+        delay: 5
+        timeout: 300
+      delegate_to: localhost
   roles:
     - role: common
 
+# -----------------------------------------
+# Jenkins node
+# -----------------------------------------
 - name: Setup Jenkins
   hosts: jenkins_group
   become: true
+  gather_facts: true
   roles:
     - role: jenkins
     - role: domain
+  tags: [jenkins]
 
+# -----------------------------------------
+# SonarQube node
+# -----------------------------------------
 - name: Setup SonarQube
   hosts: sonarqube_group
   become: true
+  gather_facts: true
   roles:
     - role: sonarqube
     - role: domain
+  tags: [sonarqube]
 
+# -----------------------------------------
+# Nexus node
+# -----------------------------------------
 - name: Setup Nexus
   hosts: nexus_group
   become: true
+  gather_facts: true
   roles:
     - role: nexus
     - role: domain
+  tags: [nexus]
