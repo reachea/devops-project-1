@@ -1,0 +1,107 @@
+---
+- name: Create infrastructure on DigitalOcean
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - group_vars/all.yml
+
+  tasks:
+    - name: Create Jenkins droplet
+      community.digitalocean.digital_ocean_droplet:
+        state: present
+        name: "{{ jenkins_name }}"
+        oauth_token: "{{ do_token }}"
+        region: "{{ region }}"
+        size: "{{ size_small }}"
+        image: "{{ image }}"
+        ssh_keys: ["{{ ssh_key_id }}"]
+        monitoring: true
+        backups: false
+        ipv6: false
+        tags: ["devops", "jenkins"]
+      register: jenkins
+
+    - name: Create SonarQube droplet
+      community.digitalocean.digital_ocean_droplet:
+        state: present
+        name: "{{ sonarqube_name }}"
+        oauth_token: "{{ do_token }}"
+        region: "{{ region }}"
+        size: "{{ size_small }}"
+        image: "{{ image }}"
+        ssh_keys: ["{{ ssh_key_id }}"]
+        monitoring: true
+        backups: false
+        ipv6: false
+        tags: ["devops", "sonarqube"]
+      register: sonarqube
+
+    - name: Create Nexus droplet
+      community.digitalocean.digital_ocean_droplet:
+        state: present
+        name: "{{ nexus_name }}"
+        oauth_token: "{{ do_token }}"
+        region: "{{ region }}"
+        size: "{{ size_small }}"
+        image: "{{ image }}"
+        ssh_keys: ["{{ ssh_key_id }}"]
+        monitoring: true
+        backups: false
+        ipv6: false
+        tags: ["devops", "nexus"]
+      register: nexus
+
+    - name: Add Jenkins host to in-memory inventory
+      add_host:
+        name: jenkins
+        ansible_host: "{{ jenkins.data.ip_address }}"
+        groups: jenkins_group,created
+        service_name: jenkins
+        service_port: 8080
+        domain: "{{ domains.jenkins }}"
+
+    - name: Add SonarQube host to in-memory inventory
+      add_host:
+        name: sonarqube
+        ansible_host: "{{ sonarqube.data.ip_address }}"
+        groups: sonarqube_group,created
+        service_name: sonarqube
+        service_port: 9000
+        domain: "{{ domains.sonarqube }}"
+
+    - name: Add Nexus host to in-memory inventory
+      add_host:
+        name: nexus
+        ansible_host: "{{ nexus.data.ip_address }}"
+        groups: nexus_group,created
+        service_name: nexus
+        service_port: 8081
+        domain: "{{ domains.nexus }}"
+
+- name: Configure base packages (common) on all servers
+  hosts: created
+  become: true
+  roles:
+    - role: common
+
+- name: Setup Jenkins
+  hosts: jenkins_group
+  become: true
+  roles:
+    - role: jenkins
+    - role: domain
+
+- name: Setup SonarQube
+  hosts: sonarqube_group
+  become: true
+  roles:
+    - role: sonarqube
+    - role: domain
+
+- name: Setup Nexus
+  hosts: nexus_group
+  become: true
+  roles:
+    - role: nexus
+    - role: domain

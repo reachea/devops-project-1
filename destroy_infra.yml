@@ -1,0 +1,26 @@
+---
+- name: Destroy infrastructure on DigitalOcean
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  vars_files:
+    - group_vars/all.yml
+
+  tasks:
+    - name: Destroy Jenkins
+      community.digitalocean.digital_ocean_droplet:
+        state: absent
+        name: "{{ jenkins_name }}"
+        oauth_token: "{{ do_token }}"
+
+    - name: Destroy SonarQube
+      community.digitalocean.digital_ocean_droplet:
+        state: absent
+        name: "{{ sonarqube_name }}"
+        oauth_token: "{{ do_token }}"
+
+    - name: Destroy Nexus
+      community.digitalocean.digital_ocean_droplet:
+        state: absent
+        name: "{{ nexus_name }}"
+        oauth_token: "{{ do_token }}"

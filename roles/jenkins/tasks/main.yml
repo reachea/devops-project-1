@@ -1,0 +1,11 @@
+---
+- name: Create Jenkins volume
+  shell: docker volume create jenkins_home
+  register: jenkins_vol
+  changed_when: "'jenkins_home' in jenkins_vol.stdout"
+
+- name: Run Jenkins container (LTS)
+  shell: |
+    if [ ! "$(docker ps -q -f name=jenkins)" ]; then
+      docker run -d --name jenkins --restart=unless-stopped         -p 8080:8080 -p 50000:50000         -v jenkins_home:/var/jenkins_home         -v /var/run/docker.sock:/var/run/docker.sock         jenkins/jenkins:lts
+    fi

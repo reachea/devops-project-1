@@ -1,0 +1,13 @@
+---
+- name: Ensure sysctl for SonarQube (vm.max_map_count)
+  sysctl:
+    name: vm.max_map_count
+    value: '262144'
+    state: present
+    reload: yes
+
+- name: Run SonarQube (community LTS)
+  shell: |
+    if [ ! "$(docker ps -q -f name=sonarqube)" ]; then
+      docker run -d --name sonarqube --restart=unless-stopped         -p 9000:9000         sonarqube:lts-community
+    fi

@@ -1,0 +1,27 @@
+---
+- name: Place Nginx reverse proxy
+  template:
+    src: nginx_reverse_proxy.conf.j2
+    dest: "/etc/nginx/sites-available/{{ service_name }}.conf"
+
+- name: Enable site
+  file:
+    src: "/etc/nginx/sites-available/{{ service_name }}.conf"
+    dest: "/etc/nginx/sites-enabled/{{ service_name }}.conf"
+    state: link
+    force: true
+
+- name: Test Nginx config
+  shell: nginx -t
+  register: nginx_test
+  changed_when: false
+
+- name: Reload Nginx
+  service:
+    name: nginx
+    state: reloaded
+
+- name: Obtain Let's Encrypt certificate
+  shell: >
+    certbot --nginx -d {{ domain }}
+    --non-interactive --agree-tos -m {{ letsencrypt_email }} --redirect

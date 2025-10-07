@@ -1,0 +1,45 @@
+---
+- name: Update apt cache & upgrade
+  apt:
+    update_cache: yes
+    upgrade: dist
+
+- name: Install base packages
+  apt:
+    name:
+      - git
+      - curl
+      - zsh
+      - ca-certificates
+      - gnupg
+      - lsb-release
+      - nginx
+      - certbot
+      - python3-certbot-nginx
+      - docker.io
+      - docker-compose-plugin
+      - python3-pip
+    state: present
+
+- name: Enable and start Docker
+  systemd:
+    name: docker
+    enabled: true
+    state: started
+
+- name: Install Oh My Zsh (non-interactive)
+  shell: |
+    export RUNZSH=no
+    export CHSH=no
+    if [ ! -d /root/.oh-my-zsh ]; then
+      sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" || true
+    fi
+  args:
+    creates: /root/.oh-my-zsh
+
+- name: Run Portainer (CE)
+  shell: |
+    docker volume create portainer_data >/dev/null 2>&1 || true
+    if [ ! "$(docker ps -q -f name=portainer)" ]; then
+      docker run -d --name portainer --restart=always         -p 9000:9000 -p 8000:8000         -v /var/run/docker.sock:/var/run/docker.sock         -v portainer_data:/data         portainer/portainer-ce
+    fi
