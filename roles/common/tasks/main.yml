@@ -1,18 +1,67 @@
 ---
-- name: Update apt cache & upgrade
-  apt:
-    update_cache: yes
-    upgrade: dist
+# roles/common/tasks/main.yml
 
+# --- Make first-boot reliable on fresh droplets ---
+- name: Wait for cloud-init to finish (if present)
+  ansible.builtin.shell: |
+    if command -v cloud-init >/dev/null 2>&1; then
+      cloud-init status --wait
+    else
+      test -f /var/lib/cloud/instance/boot-finished || true
+    fi
+  register: cloudinit_status
+  changed_when: false
+  failed_when: false
+  tags: [init, apt]
+
+- name: Wait until no APT/Dpkg locks are held
+  ansible.builtin.shell: |
+    set -e
+    for i in {1..60}; do
+      if fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock >/dev/null 2>&1; then
+        sleep 5
+      elif pgrep -ax "apt|apt-get|unattended-upgrade|dpkg" >/dev/null 2>&1; then
+        sleep 5
+      else
+        exit 0
+      fi
+    done
+    echo "APT locks still present" >&2
+    exit 1
+  register: apt_locks
+  changed_when: false
+  tags: [init, apt]
+
+# --- Update & upgrade with retries (handles transient mirrors) ---
+- name: Update apt cache
+  ansible.builtin.apt:
+    update_cache: yes
+    cache_valid_time: 3600
+  register: apt_update
+  retries: 5
+  delay: 6
+  until: apt_update is succeeded
+  tags: [apt]
+
+- name: Dist upgrade
+  ansible.builtin.apt:
+    upgrade: dist
+  register: apt_upgrade
+  retries: 5
+  delay: 6
+  until: apt_upgrade is succeeded
+  tags: [apt]
+
+# --- Base packages ---
 - name: Install base packages
-  apt:
+  ansible.builtin.apt:
     name:
       - git
       - curl
-      - zsh
       - ca-certificates
       - gnupg
       - lsb-release
+      - zsh
       - nginx
       - certbot
       - python3-certbot-nginx
@@ -20,15 +69,33 @@
       - docker-compose-plugin
       - python3-pip
     state: present
+  register: apt_pkgs
+  retries: 5
+  delay: 6
+  until: apt_pkgs is succeeded
+  tags: [packages]
 
+# --- Docker service ---
 - name: Enable and start Docker
-  systemd:
+  ansible.builtin.systemd:
     name: docker
     enabled: true
     state: started
+  tags: [docker]
 
-- name: Install Oh My Zsh (non-interactive)
-  shell: |
+# Optional: allow the default user to use Docker without sudo (only if not root).
+# Commented by default; uncomment and set `docker_user` via host vars if you need it.
+# - name: Add {{ docker_user | default('root') }} to docker group
+#   ansible.builtin.user:
+#     name: "{{ docker_user }}"
+#     groups: docker
+#     append: yes
+#   when: docker_user is defined and docker_user != 'root'
+#   tags: [docker]
+
+# --- Oh My Zsh (non-interactive, safe if re-run) ---
+- name: Install Oh My Zsh for root (non-interactive)
+  ansible.builtin.shell: |
     export RUNZSH=no
     export CHSH=no
     if [ ! -d /root/.oh-my-zsh ]; then
@@ -36,10 +103,45 @@
     fi
   args:
     creates: /root/.oh-my-zsh
+  tags: [shell]
 
-- name: Run Portainer (CE)
-  shell: |
-    docker volume create portainer_data >/dev/null 2>&1 || true
+# --- Portainer (simple Docker UI) ---
+- name: Create Portainer volume
+  ansible.builtin.shell: docker volume create portainer_data
+  register: portainer_vol
+  changed_when: "'portainer_data' in portainer_vol.stdout"
+  failed_when: false
+  tags: [portainer]
+
+- name: Run Portainer CE (idempotent)
+  ansible.builtin.shell: |
     if [ ! "$(docker ps -q -f name=portainer)" ]; then
-      docker run -d --name portainer --restart=always         -p 9000:9000 -p 8000:8000         -v /var/run/docker.sock:/var/run/docker.sock         -v portainer_data:/data         portainer/portainer-ce
+      if [ "$(docker ps -aq -f status=exited -f name=portainer)" ]; then
+        docker rm -f portainer >/dev/null 2>&1 || true
+      fi
+      docker run -d --name portainer --restart=always \
+        -p 9000:9000 -p 8000:8000 \
+        -v /var/run/docker.sock:/var/run/docker.sock \
+        -v portainer_data:/data \
+        portainer/portainer-ce
     fi
+  changed_when: false
+  failed_when: false
+  tags: [portainer]
+
+# --- Nginx health check before domain role runs ---
+- name: Ensure Nginx is started
+  ansible.builtin.service:
+    name: nginx
+    state: started
+    enabled: true
+  tags: [nginx]
+
+# --- Kernel/sysctl knobs commonly needed by SonarQube (safe for others) ---
+- name: Ensure vm.max_map_count is set for Elasticsearch-based apps
+  ansible.builtin.sysctl:
+    name: vm.max_map_count
+    value: "262144"
+    state: present
+    reload: yes
+  tags: [sysctl]
