@@ -1,7 +1,12 @@
 ---
 # roles/common/tasks/main.yml
+# Robust, idempotent common setup for fresh Ubuntu 22.04 droplets on DO.
+# Includes: cloud-init/apt lock handling, base packages, Docker (official repo),
+# docker compose v2, Portainer, Nginx, and SonarQube sysctl.
 
-# --- Make first-boot reliable on fresh droplets ---
+# -----------------------------
+# First-boot / apt safety nets
+# -----------------------------
 - name: Wait for cloud-init to finish (if present)
   ansible.builtin.shell: |
     if command -v cloud-init >/dev/null 2>&1; then
@@ -32,7 +37,9 @@
   changed_when: false
   tags: [init, apt]
 
-# --- Update & upgrade with retries (handles transient mirrors) ---
+# -----------------------------
+# Update & upgrade
+# -----------------------------
 - name: Update apt cache
   ansible.builtin.apt:
     update_cache: yes
@@ -52,7 +59,54 @@
   until: apt_upgrade is succeeded
   tags: [apt]
 
-# --- Base packages ---
+# -----------------------------
+# Docker official repository
+# -----------------------------
+- name: Ensure required apt tooling is present (for Docker repo)
+  ansible.builtin.apt:
+    name:
+      - ca-certificates
+      - curl
+      - gnupg
+      - lsb-release
+    state: present
+    update_cache: yes
+  tags: [docker_repo]
+
+- name: Create keyrings dir
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: "0755"
+  tags: [docker_repo]
+
+- name: Add Docker GPG key
+  ansible.builtin.shell: |
+    set -e
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    chmod a+r /etc/apt/keyrings/docker.gpg
+  args:
+    creates: /etc/apt/keyrings/docker.gpg
+  tags: [docker_repo]
+
+- name: Add Docker apt repository
+  ansible.builtin.shell: |
+    set -e
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" \
+> /etc/apt/sources.list.d/docker.list
+  args:
+    creates: /etc/apt/sources.list.d/docker.list
+  tags: [docker_repo]
+
+- name: apt update after adding Docker repo
+  ansible.builtin.apt:
+    update_cache: yes
+  tags: [docker_repo]
+
+# -----------------------------
+# Base packages (no docker here)
+# -----------------------------
 - name: Install base packages
   ansible.builtin.apt:
     name:
@@ -65,17 +119,39 @@
       - nginx
       - certbot
       - python3-certbot-nginx
-      - docker.io
-      - docker-compose-plugin
       - python3-pip
     state: present
-  register: apt_pkgs
+  register: base_pkgs
   retries: 5
   delay: 6
-  until: apt_pkgs is succeeded
+  until: base_pkgs is succeeded
   tags: [packages]
 
-# --- Docker service ---
+# -----------------------------
+# Docker engine + Compose v2
+# -----------------------------
+- name: Remove distro docker.io if present (prefer docker-ce)
+  ansible.builtin.apt:
+    name: docker.io
+    state: absent
+  ignore_errors: true
+  tags: [docker]
+
+- name: Install Docker CE and plugins (Compose v2 + Buildx)
+  ansible.builtin.apt:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-buildx-plugin
+      - docker-compose-plugin
+    state: present
+  register: docker_pkgs
+  retries: 5
+  delay: 6
+  until: docker_pkgs is succeeded
+  tags: [docker]
+
 - name: Enable and start Docker
   ansible.builtin.systemd:
     name: docker
@@ -83,8 +159,7 @@
     state: started
   tags: [docker]
 
-# Optional: allow the default user to use Docker without sudo (only if not root).
-# Commented by default; uncomment and set `docker_user` via host vars if you need it.
+# Optional: enable non-root docker usage (set docker_user at host/group level)
 # - name: Add {{ docker_user | default('root') }} to docker group
 #   ansible.builtin.user:
 #     name: "{{ docker_user }}"
@@ -93,7 +168,9 @@
 #   when: docker_user is defined and docker_user != 'root'
 #   tags: [docker]
 
-# --- Oh My Zsh (non-interactive, safe if re-run) ---
+# -----------------------------
+# Oh My Zsh (non-interactive)
+# -----------------------------
 - name: Install Oh My Zsh for root (non-interactive)
   ansible.builtin.shell: |
     export RUNZSH=no
@@ -105,7 +182,9 @@
     creates: /root/.oh-my-zsh
   tags: [shell]
 
-# --- Portainer (simple Docker UI) ---
+# -----------------------------
+# Portainer CE (Docker UI)
+# -----------------------------
 - name: Create Portainer volume
   ansible.builtin.shell: docker volume create portainer_data
   register: portainer_vol
@@ -129,7 +208,9 @@
   failed_when: false
   tags: [portainer]
 
-# --- Nginx health check before domain role runs ---
+# -----------------------------
+# Nginx availability (for domain role)
+# -----------------------------
 - name: Ensure Nginx is started
   ansible.builtin.service:
     name: nginx
@@ -137,11 +218,13 @@
     enabled: true
   tags: [nginx]
 
-# --- Kernel/sysctl knobs commonly needed by SonarQube (safe for others) ---
+# -----------------------------
+# SonarQube-friendly sysctl
+# -----------------------------
 - name: Ensure vm.max_map_count is set for Elasticsearch-based apps
   ansible.builtin.sysctl:
     name: vm.max_map_count
-    value: "262144"
+    value: '262144'
     state: present
     reload: yes
   tags: [sysctl]
