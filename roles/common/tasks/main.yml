@@ -1,10 +1,12 @@
 ---
 # roles/common/tasks/main.yml
-# Robust, idempotent common setup for Ubuntu 22.04 on DigitalOcean.
+# Common baseline for fresh Ubuntu 22.04 droplets on DigitalOcean.
+# Handles: cloud-init wait, apt lock handling, updates, Docker (official repo),
+# docker compose v2, Portainer, Nginx, and SonarQube-friendly sysctl.
 
-# -----------------------------
-# First-boot / apt safety nets
-# -----------------------------
+############################
+# First-boot / apt safety  #
+############################
 - name: Wait for cloud-init to finish (if present)
   ansible.builtin.shell: |
     if command -v cloud-init >/dev/null 2>&1; then
@@ -35,9 +37,9 @@
   changed_when: false
   tags: [init, apt]
 
-# -----------------------------
-# Update & upgrade
-# -----------------------------
+############################
+# Update & upgrade         #
+############################
 - name: Update apt cache
   ansible.builtin.apt:
     update_cache: yes
@@ -57,9 +59,9 @@
   until: apt_upgrade is succeeded
   tags: [apt]
 
-# -----------------------------
-# Docker official repository
-# -----------------------------
+#############################################
+# Docker official repository (stable)       #
+#############################################
 - name: Ensure required apt tooling is present (for Docker repo)
   ansible.builtin.apt:
     name:
@@ -69,6 +71,19 @@
       - lsb-release
     state: present
     update_cache: yes
+  tags: [docker_repo]
+
+- name: Ensure facts are present (for arch & codename)
+  ansible.builtin.setup:
+  tags: [docker_repo]
+
+- name: Compute Debian arch and Ubuntu codename
+  ansible.builtin.set_fact:
+    deb_arch: >-
+      {{ 'amd64' if ansible_facts.architecture in ['x86_64','amd64']
+         else ('arm64' if ansible_facts.architecture in ['aarch64','arm64']
+         else ansible_facts.architecture) }}
+    ubuntu_codename: "{{ ansible_facts.lsb.codename | default('jammy') }}"
   tags: [docker_repo]
 
 - name: Create keyrings directory for apt
@@ -95,7 +110,7 @@
 
 - name: Add Docker apt repository (stable)
   ansible.builtin.apt_repository:
-    repo: "deb [arch={{ ansible_architecture | default('amd64') }} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu {{ ansible_lsb.codename | default('jammy') }} stable"
+    repo: "deb [arch={{ deb_arch }} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu {{ ubuntu_codename }} stable"
     filename: docker
     state: present
   tags: [docker_repo]
@@ -105,9 +120,9 @@
     update_cache: yes
   tags: [docker_repo]
 
-# -----------------------------
-# Base packages (no docker here)
-# -----------------------------
+#############################################
+# Base packages (no docker here)            #
+#############################################
 - name: Install base packages
   ansible.builtin.apt:
     name:
@@ -128,9 +143,9 @@
   until: base_pkgs is succeeded
   tags: [packages]
 
-# -----------------------------
-# Docker engine + Compose v2
-# -----------------------------
+#############################################
+# Docker engine + Compose v2 from Docker    #
+#############################################
 - name: Remove distro docker.io if present (prefer docker-ce)
   ansible.builtin.apt:
     name: docker.io
@@ -169,9 +184,9 @@
 #   when: docker_user is defined and docker_user != 'root'
 #   tags: [docker]
 
-# -----------------------------
-# Oh My Zsh (non-interactive)
-# -----------------------------
+#############################################
+# Oh My Zsh (non-interactive)               #
+#############################################
 - name: Install Oh My Zsh for root (non-interactive)
   ansible.builtin.shell: |
     export RUNZSH=no
@@ -183,9 +198,9 @@
     creates: /root/.oh-my-zsh
   tags: [shell]
 
-# -----------------------------
-# Portainer CE (Docker UI)
-# -----------------------------
+#############################################
+# Portainer CE (Docker UI)                  #
+#############################################
 - name: Create Portainer volume
   ansible.builtin.shell: docker volume create portainer_data
   register: portainer_vol
@@ -209,9 +224,9 @@
   failed_when: false
   tags: [portainer]
 
-# -----------------------------
-# Nginx availability (for domain role)
-# -----------------------------
+#############################################
+# Nginx availability (for domain role)      #
+#############################################
 - name: Ensure Nginx is started
   ansible.builtin.service:
     name: nginx
@@ -219,9 +234,9 @@
     enabled: true
   tags: [nginx]
 
-# -----------------------------
-# SonarQube-friendly sysctl
-# -----------------------------
+#############################################
+# SonarQube-friendly sysctl                 #
+#############################################
 - name: Ensure vm.max_map_count is set for Elasticsearch-based apps
   ansible.builtin.sysctl:
     name: vm.max_map_count
