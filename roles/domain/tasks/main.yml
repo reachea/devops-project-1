@@ -1,27 +1,106 @@
 ---
-- name: Place Nginx reverse proxy
-  template:
-    src: nginx_reverse_proxy.conf.j2
+# roles/domain/tasks/main.yml
+# Issue/renew Let's Encrypt via webroot and switch the site to HTTPS.
+# Requires host vars:
+#   service_name: jenkins | sonarqube | nexus
+#   service_port: 8080 | 9000 | 8081
+#   domain: FQDN (e.g., jenkins.example.com)
+# And global var in group_vars/all.yml:
+#   letsencrypt_email: admin@example.com
+
+- name: Ensure ACME webroot exists
+  ansible.builtin.file:
+    path: /var/www/letsencrypt
+    state: directory
+    owner: www-data
+    group: www-data
+    mode: "0755"
+
+# ---------------------------
+# Stage 1: HTTP-only site
+# ---------------------------
+- name: Place HTTP-only Nginx site (serves ACME + proxies app)
+  ansible.builtin.template:
+    src: nginx_site_http.conf.j2
     dest: "/etc/nginx/sites-available/{{ service_name }}.conf"
 
-- name: Enable site
-  file:
+- name: Enable site (HTTP-only)
+  ansible.builtin.file:
     src: "/etc/nginx/sites-available/{{ service_name }}.conf"
     dest: "/etc/nginx/sites-enabled/{{ service_name }}.conf"
     state: link
     force: true
 
-- name: Test Nginx config
-  shell: nginx -t
-  register: nginx_test
+- name: Test Nginx config (HTTP-only)
+  ansible.builtin.shell: nginx -t
+  register: nginx_test_http
   changed_when: false
 
-- name: Reload Nginx
-  service:
+- name: Reload Nginx (HTTP-only)
+  ansible.builtin.service:
     name: nginx
     state: reloaded
 
-- name: Obtain Let's Encrypt certificate
-  shell: >
-    certbot --nginx -d {{ domain }}
-    --non-interactive --agree-tos -m {{ letsencrypt_email }} --redirect
+# Optional UFW open (DigitalOcean usually has ufw disabled)
+- name: Allow Nginx Full via UFW (optional)
+  ansible.builtin.shell: |
+    if command -v ufw >/dev/null 2>&1; then ufw allow 'Nginx Full' || true; fi
+  changed_when: false
+  failed_when: false
+
+# Ensure port 80 is reachable before ACME
+- name: Wait for HTTP to respond on port 80
+  ansible.builtin.wait_for:
+    host: "{{ ansible_host | default('127.0.0.1') }}"
+    port: 80
+    delay: 2
+    timeout: 180
+  delegate_to: localhost
+
+# ---------------------------
+# Stage 2: Obtain certificate
+# ---------------------------
+- name: Obtain/renew certificate via webroot
+  ansible.builtin.shell: >
+    certbot certonly --webroot
+    -w /var/www/letsencrypt
+    -d {{ domain }}
+    -m {{ letsencrypt_email }}
+    --agree-tos --non-interactive --keep-until-expiring
+  register: certbot_result
+  retries: 3
+  delay: 10
+  until: certbot_result.rc == 0
+  changed_when: >
+    ('Congratulations!' in certbot_result.stdout) or
+    ('Congratulations!' in certbot_result.stderr)
+  failed_when: certbot_result.rc != 0
+
+# ---------------------------
+# Stage 3: HTTPS server block
+# ---------------------------
+- name: Place HTTPS Nginx site (redirect 80→443 and proxy to app)
+  ansible.builtin.template:
+    src: nginx_site_ssl.conf.j2
+    dest: "/etc/nginx/sites-available/{{ service_name }}.conf"
+
+- name: Test Nginx config (HTTPS)
+  ansible.builtin.shell: nginx -t
+  register: nginx_test_ssl
+  changed_when: false
+
+- name: Reload Nginx (HTTPS)
+  ansible.builtin.service:
+    name: nginx
+    state: reloaded
+
+# ---------------------------
+# Post-check (optional)
+# ---------------------------
+- name: Verify HTTPS is up (port 443)
+  ansible.builtin.wait_for:
+    host: "{{ ansible_host | default('127.0.0.1') }}"
+    port: 443
+    delay: 2
+    timeout: 120
+  delegate_to: localhost

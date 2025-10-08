@@ -1,0 +1,23 @@
+# HTTP-only server used for initial ACME validation
+server {
+    listen 80;
+    server_name {{ domain }};
+
+    # ACME challenge served from webroot
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/letsencrypt;
+        default_type "text/plain";
+        try_files $uri =404;
+    }
+
+    # Proxy to the app (Jenkins/Sonar/Nexus) on its local port
+    location / {
+        proxy_pass http://127.0.0.1:{{ service_port }};
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    client_max_body_size 1G;
+}
