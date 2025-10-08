@@ -1,8 +1,6 @@
 ---
 # roles/common/tasks/main.yml
-# Robust, idempotent common setup for fresh Ubuntu 22.04 droplets on DO.
-# Includes: cloud-init/apt lock handling, base packages, Docker (official repo),
-# docker compose v2, Portainer, Nginx, and SonarQube sysctl.
+# Robust, idempotent common setup for Ubuntu 22.04 on DigitalOcean.
 
 # -----------------------------
 # First-boot / apt safety nets
@@ -73,30 +71,33 @@
     update_cache: yes
   tags: [docker_repo]
 
-- name: Create keyrings dir
+- name: Create keyrings directory for apt
   ansible.builtin.file:
     path: /etc/apt/keyrings
     state: directory
     mode: "0755"
   tags: [docker_repo]
 
-- name: Add Docker GPG key
+- name: Download Docker GPG key (raw)
+  ansible.builtin.get_url:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    dest: /etc/apt/keyrings/docker.gpg.raw
+    mode: "0644"
+  tags: [docker_repo]
+
+- name: Convert Docker GPG key to keyring format
   ansible.builtin.shell: |
-    set -e
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    gpg --dearmor < /etc/apt/keyrings/docker.gpg.raw > /etc/apt/keyrings/docker.gpg
     chmod a+r /etc/apt/keyrings/docker.gpg
   args:
     creates: /etc/apt/keyrings/docker.gpg
   tags: [docker_repo]
 
-- name: Add Docker apt repository
-  ansible.builtin.shell: |
-    set -e
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
-https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CODENAME) stable" \
-> /etc/apt/sources.list.d/docker.list
-  args:
-    creates: /etc/apt/sources.list.d/docker.list
+- name: Add Docker apt repository (stable)
+  ansible.builtin.apt_repository:
+    repo: "deb [arch={{ ansible_architecture | default('amd64') }} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu {{ ansible_lsb.codename | default('jammy') }} stable"
+    filename: docker
+    state: present
   tags: [docker_repo]
 
 - name: apt update after adding Docker repo
@@ -224,7 +225,7 @@ https://download.docker.com/linux/ubuntu $(. /etc/os-release && echo $VERSION_CO
 - name: Ensure vm.max_map_count is set for Elasticsearch-based apps
   ansible.builtin.sysctl:
     name: vm.max_map_count
-    value: '262144'
+    value: "262144"
     state: present
     reload: yes
   tags: [sysctl]
