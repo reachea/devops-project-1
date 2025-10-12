@@ -102,30 +102,3 @@
   changed_when: false
   failed_when: false
   tags: [nexus]
-
-# ---------------- Nginx HTTP site (TLS later) ----------------
-- name: Drop Nginx site for Nexus (HTTP proxy)
-  ansible.builtin.template:
-    src: nexus_nginx_http.conf.j2
-    dest: /etc/nginx/sites-available/nexus.conf
-  tags: [nexus]
-
-- name: Enable Nexus Nginx site (HTTP)
-  ansible.builtin.file:
-    src: /etc/nginx/sites-available/nexus.conf
-    dest: /etc/nginx/sites-enabled/nexus.conf
-    state: link
-    force: true
-  tags: [nexus]
-
-- name: Test Nginx config
-  ansible.builtin.shell: nginx -t
-  register: nginx_test
-  changed_when: false
-  tags: [nexus]
-
-- name: Reload Nginx
-  ansible.builtin.service:
-    name: nginx
-    state: reloaded
-  tags: [nexus]
