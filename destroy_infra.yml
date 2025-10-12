@@ -6,21 +6,61 @@
   vars_files:
     - group_vars/all.yml
 
+  vars:
+    droplet_names:
+      - "{{ jenkins_name }}"
+      - "{{ sonarqube_name }}"
+      - "{{ nexus_name }}"
+
   tasks:
-    - name: Destroy Jenkins
-      community.digitalocean.digital_ocean_droplet:
-        state: absent
-        name: "{{ jenkins_name }}"
-        oauth_token: "{{ do_token }}"
+    - name: Sanity check required vars
+      ansible.builtin.assert:
+        that:
+          - do_token is defined
+          - droplet_names | length > 0
+        fail_msg: "Missing do_token or droplet_names. Check group_vars/all.yml."
 
-    - name: Destroy SonarQube
-      community.digitalocean.digital_ocean_droplet:
-        state: absent
-        name: "{{ sonarqube_name }}"
-        oauth_token: "{{ do_token }}"
+    - name: Iterate droplet names and fetch info
+      vars:
+        target_name: "{{ item }}"
+      block:
+        - name: Get droplet info by name
+          community.digitalocean.digital_ocean_droplet_info:
+            oauth_token: "{{ do_token }}"
+            name: "{{ target_name }}"
+          register: do_info
 
-    - name: Destroy Nexus
-      community.digitalocean.digital_ocean_droplet:
-        state: absent
-        name: "{{ nexus_name }}"
-        oauth_token: "{{ do_token }}"
+        - name: Normalize droplet object (supports .data[] or .droplets[])
+          set_fact:
+            droplet_obj: >-
+              {{
+                (do_info.data | default([]))
+                | selectattr('name','equalto', target_name)
+                | list | first | default(
+                  (do_info.droplets | default([]))
+                  | selectattr('name','equalto', target_name)
+                  | list | first
+                )
+              }}
+
+        - name: Delete droplet by ID when found
+          community.digitalocean.digital_ocean_droplet:
+            state: absent
+            id: "{{ droplet_obj.id }}"
+            oauth_token: "{{ do_token }}"
+          when: droplet_obj is defined and droplet_obj and (droplet_obj.id is defined)
+
+        - name: Fallback — delete by unique name (if ID not found)
+          community.digitalocean.digital_ocean_droplet:
+            state: absent
+            name: "{{ target_name }}"
+            unique_name: true
+            oauth_token: "{{ do_token }}"
+          when: droplet_obj is not defined or not droplet_obj or (droplet_obj.id is not defined)
+      loop: "{{ droplet_names }}"
+      loop_control:
+        label: "{{ item }}"
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg: "Requested destroy for droplets: {{ droplet_names | join(', ') }} (absent now if they existed)"
