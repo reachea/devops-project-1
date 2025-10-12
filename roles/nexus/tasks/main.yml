@@ -1,14 +1,87 @@
 ---
-- name: Create Nexus data directory
-  file:
-    path: /opt/nexus-data
-    state: directory
-    owner: root
-    group: root
-    mode: '0755'
+# roles/nexus/tasks/main.yml
 
-- name: Run Nexus3
-  shell: |
-    if [ ! "$(docker ps -q -f name=nexus)" ]; then
-      docker run -d --name nexus --restart=unless-stopped         -p 8081:8081         -v /opt/nexus-data:/nexus-data         sonatype/nexus3
-    fi
+- name: Ensure python3-docker (SDK) is installed for docker modules
+  ansible.builtin.apt:
+    name: python3-docker
+    state: present
+    update_cache: yes
+  tags: [nexus]
+
+- name: Ensure Docker service is running
+  ansible.builtin.systemd:
+    name: docker
+    state: started
+    enabled: true
+  tags: [nexus]
+
+- name: Ensure Nexus named volume exists
+  community.docker.docker_volume:
+    name: nexus_data
+    state: present
+  tags: [nexus]
+
+# Initialize ownership and required dirs inside the volume for UID 200
+- name: Initialize nexus_data (mkdir & chown to 200:200)
+  community.docker.docker_container:
+    name: nexus-init
+    image: alpine:3
+    auto_remove: true
+    detach: false
+    volumes:
+      - nexus_data:/nexus-data
+    command: >
+      sh -c "mkdir -p /nexus-data/{etc,log,tmp,javaprefs} &&
+             chown -R 200:200 /nexus-data"
+  register: nx_init
+  changed_when: "'mkdir' in nx_init.stdout or 'chown' in nx_init.stdout"
+  tags: [nexus]
+
+# Run Nexus 3 (explicit NEXUS_DATA and modest JVM for 2GB droplets)
+- name: Run Nexus 3 container
+  community.docker.docker_container:
+    name: nexus
+    image: sonatype/nexus3:latest
+    pull: true
+    restart_policy: unless-stopped
+    state: started
+    published_ports:
+      - "8081:8081"
+    volumes:
+      - "nexus_data:/nexus-data"
+    env:
+      NEXUS_DATA: /nexus-data
+      INSTALL4J_ADD_VM_PARAMS: >-
+        -Xms768m -Xmx1024m
+        -XX:MaxDirectMemorySize=1024m
+        -Djava.util.prefs.userRoot=/nexus-data/javaprefs
+  tags: [nexus]
+
+# Wait for TCP port to open
+- name: Wait for container port 8081 to open
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: 8081
+    delay: 5
+    timeout: 600
+  tags: [nexus]
+
+# Wait until the app is actually ready (status endpoint returns 200)
+- name: Wait for Nexus status endpoint to return 200
+  ansible.builtin.shell: |
+    for i in $(seq 1 60); do
+      code=$(curl -s -o /tmp/nx.json -w '%{http_code}' http://127.0.0.1:8081/service/rest/v1/status || true)
+      if [ "$code" = "200" ]; then exit 0; fi
+      sleep 5
+    done
+    exit 1
+  register: nexus_status
+  changed_when: false
+  tags: [nexus]
+
+- name: Show Nexus status (debug)
+  ansible.builtin.shell: cat /tmp/nx.json || true
+  register: nx_status_body
+  changed_when: false
+  failed_when: false
+  tags: [nexus]
