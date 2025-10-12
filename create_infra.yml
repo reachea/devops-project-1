@@ -190,7 +190,7 @@
       when: (post_create_wait_seconds | default(60) | int) > 0
 
 # -----------------------------------------
-# Configure base packages (common) on all servers
+# Base OS & Docker/Nginx (common) on all servers
 # -----------------------------------------
 - name: Configure base packages (common) on all servers
   hosts: created
@@ -238,12 +238,73 @@
       ansible.builtin.setup:
 
   roles:
-    - role: common
+    - role: common # <- installs Docker, Nginx, Certbot, Portainer(9443), etc.
 
 # -----------------------------------------
-# Jenkins node (with DNS wait before HTTPS)
+# App setup (HTTP-only, no TLS yet)
 # -----------------------------------------
-- name: Setup Jenkins
+
+- name: Setup Jenkins (HTTP-only)
+  hosts: jenkins_group
+  become: true
+  gather_facts: true
+  pre_tasks:
+    - name: Ensure Docker present (self-heal)
+      ansible.builtin.shell: command -v docker
+      register: has_docker_jenkins
+      changed_when: false
+      failed_when: false
+
+    - name: Install Docker from common role if missing
+      ansible.builtin.import_role:
+        name: common
+      when: has_docker_jenkins.rc != 0
+  roles:
+    - role: jenkins
+  tags: [jenkins]
+
+- name: Setup SonarQube (HTTP-only)
+  hosts: sonarqube_group
+  become: true
+  gather_facts: true
+  pre_tasks:
+    - name: Ensure Docker present (self-heal)
+      ansible.builtin.shell: command -v docker
+      register: has_docker_sonar
+      changed_when: false
+      failed_when: false
+
+    - name: Install Docker from common role if missing
+      ansible.builtin.import_role:
+        name: common
+      when: has_docker_sonar.rc != 0
+  roles:
+    - role: sonarqube
+  tags: [sonarqube]
+
+- name: Setup Nexus (HTTP-only)
+  hosts: nexus_group
+  become: true
+  gather_facts: true
+  pre_tasks:
+    - name: Ensure Docker present (self-heal)
+      ansible.builtin.shell: command -v docker
+      register: has_docker_nexus
+      changed_when: false
+      failed_when: false
+
+    - name: Install Docker from common role if missing
+      ansible.builtin.import_role:
+        name: common
+      when: has_docker_nexus.rc != 0
+  roles:
+    - role: nexus
+  tags: [nexus]
+
+# -----------------------------------------
+# FINAL STAGE — Enable HTTPS & domain (last)
+# -----------------------------------------
+- name: Enable HTTPS & domain for Jenkins (LAST)
   hosts: jenkins_group
   become: true
   gather_facts: true
@@ -264,7 +325,7 @@
 
     - name: Resolve domain to IPs on control machine (for precheck)
       ansible.builtin.command: bash -lc "getent ahostsv4 {{ domain }} | awk '{print $1}' | paste -sd ',' -"
-      register: dns_resolve
+      register: dns_resolve_j
       delegate_to: localhost
       changed_when: false
       failed_when: false
@@ -272,7 +333,7 @@
 
     - name: Set resolved and expected IP facts
       set_fact:
-        resolved_ips: "{{ dns_resolve.stdout | default('') }}"
+        resolved_ips: "{{ dns_resolve_j.stdout | default('') }}"
         expected_ip: "{{ ansible_default_ipv4.address | default(ansible_host) }}"
       run_once: true
 
@@ -286,14 +347,10 @@
         - not (resolved_ips is search(expected_ip))
       run_once: true
   roles:
-    - role: jenkins
     - role: domain
-  tags: [jenkins]
+  tags: [jenkins, https]
 
-# -----------------------------------------
-# SonarQube node (with DNS wait before HTTPS)
-# -----------------------------------------
-- name: Setup SonarQube
+- name: Enable HTTPS & domain for SonarQube (LAST)
   hosts: sonarqube_group
   become: true
   gather_facts: true
@@ -314,7 +371,7 @@
 
     - name: Resolve domain to IPs on control machine (for precheck)
       ansible.builtin.command: bash -lc "getent ahostsv4 {{ domain }} | awk '{print $1}' | paste -sd ',' -"
-      register: dns_resolve
+      register: dns_resolve_s
       delegate_to: localhost
       changed_when: false
       failed_when: false
@@ -322,7 +379,7 @@
 
     - name: Set resolved and expected IP facts
       set_fact:
-        resolved_ips: "{{ dns_resolve.stdout | default('') }}"
+        resolved_ips: "{{ dns_resolve_s.stdout | default('') }}"
         expected_ip: "{{ ansible_default_ipv4.address | default(ansible_host) }}"
       run_once: true
 
@@ -336,14 +393,10 @@
         - not (resolved_ips is search(expected_ip))
       run_once: true
   roles:
-    - role: sonarqube
     - role: domain
-  tags: [sonarqube]
+  tags: [sonarqube, https]
 
-# -----------------------------------------
-# Nexus node (with DNS wait before HTTPS)
-# -----------------------------------------
-- name: Setup Nexus
+- name: Enable HTTPS & domain for Nexus (LAST)
   hosts: nexus_group
   become: true
   gather_facts: true
@@ -364,7 +417,7 @@
 
     - name: Resolve domain to IPs on control machine (for precheck)
       ansible.builtin.command: bash -lc "getent ahostsv4 {{ domain }} | awk '{print $1}' | paste -sd ',' -"
-      register: dns_resolve
+      register: dns_resolve_n
       delegate_to: localhost
       changed_when: false
       failed_when: false
@@ -372,7 +425,7 @@
 
     - name: Set resolved and expected IP facts
       set_fact:
-        resolved_ips: "{{ dns_resolve.stdout | default('') }}"
+        resolved_ips: "{{ dns_resolve_n.stdout | default('') }}"
         expected_ip: "{{ ansible_default_ipv4.address | default(ansible_host) }}"
       run_once: true
 
@@ -386,6 +439,5 @@
         - not (resolved_ips is search(expected_ip))
       run_once: true
   roles:
-    - role: nexus
     - role: domain
-  tags: [nexus]
+  tags: [nexus, https]
