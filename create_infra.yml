@@ -6,12 +6,6 @@
   vars_files:
     - group_vars/all.yml
 
-  vars:
-    # ====== TUNABLE WAITS ======
-    post_create_wait_seconds: 60 # extra sleep after droplets are created (0 to skip)
-    dns_wait_mode: "prompt" # "prompt" or "seconds"
-    dns_wait_seconds: 120 # used only when dns_wait_mode == "seconds"
-
   tasks:
     - name: Sanity check required vars
       ansible.builtin.assert:
@@ -188,12 +182,12 @@
         domain: "{{ domains.nexus }}"
 
     # -------------------------
-    # Post-create wait knobs
+    # Optional post-create sleep (safe default)
     # -------------------------
     - name: Optional post-create sleep
       pause:
-        seconds: "{{ post_create_wait_seconds | int }}"
-      when: (post_create_wait_seconds | int) > 0
+        seconds: "{{ post_create_wait_seconds | default(60) | int }}"
+      when: (post_create_wait_seconds | default(60) | int) > 0
 
 # -----------------------------------------
 # Configure base packages (common) on all servers
@@ -256,8 +250,8 @@
   pre_tasks:
     - name: DNS wait (seconds) before HTTPS
       pause:
-        seconds: "{{ dns_wait_seconds | int }}"
-      when: dns_wait_mode == 'seconds' and (dns_wait_seconds | int) > 0
+        seconds: "{{ dns_wait_seconds | default(120) | int }}"
+      when: (dns_wait_mode | default('prompt')) == 'seconds' and (dns_wait_seconds | default(0) | int) > 0
       run_once: true
 
     - name: DNS wait (prompt) before HTTPS
@@ -265,14 +259,20 @@
         prompt: |
           Ensure DNS A record for {{ domain }} points to {{ ansible_default_ipv4.address | default(ansible_host) }} (Cloudflare: set 'DNS only' until first cert).
           Press Enter to continue with HTTPS enablement (Ctrl-C to abort)...
-      when: dns_wait_mode == 'prompt'
+      when: (dns_wait_mode | default('prompt')) == 'prompt'
       run_once: true
 
-    - name: Optional DNS precheck (requires community.general.dig)
-      vars:
-        query_name: "{{ domain }}"
+    - name: Resolve domain to IPs on control machine (for precheck)
+      ansible.builtin.command: bash -lc "getent ahostsv4 {{ domain }} | awk '{print $1}' | paste -sd ',' -"
+      register: dns_resolve
+      delegate_to: localhost
+      changed_when: false
+      failed_when: false
+      run_once: true
+
+    - name: Set resolved and expected IP facts
       set_fact:
-        resolved_ips: "{{ lookup('community.general.dig', query_name, 'qtype=A') | default('') }}"
+        resolved_ips: "{{ dns_resolve.stdout | default('') }}"
         expected_ip: "{{ ansible_default_ipv4.address | default(ansible_host) }}"
       run_once: true
 
@@ -300,8 +300,8 @@
   pre_tasks:
     - name: DNS wait (seconds) before HTTPS
       pause:
-        seconds: "{{ dns_wait_seconds | int }}"
-      when: dns_wait_mode == 'seconds' and (dns_wait_seconds | int) > 0
+        seconds: "{{ dns_wait_seconds | default(120) | int }}"
+      when: (dns_wait_mode | default('prompt')) == 'seconds' and (dns_wait_seconds | default(0) | int) > 0
       run_once: true
 
     - name: DNS wait (prompt) before HTTPS
@@ -309,14 +309,20 @@
         prompt: |
           Ensure DNS A record for {{ domain }} points to {{ ansible_default_ipv4.address | default(ansible_host) }} (Cloudflare: set 'DNS only' until first cert).
           Press Enter to continue with HTTPS enablement (Ctrl-C to abort)...
-      when: dns_wait_mode == 'prompt'
+      when: (dns_wait_mode | default('prompt')) == 'prompt'
       run_once: true
 
-    - name: Optional DNS precheck (requires community.general.dig)
-      vars:
-        query_name: "{{ domain }}"
+    - name: Resolve domain to IPs on control machine (for precheck)
+      ansible.builtin.command: bash -lc "getent ahostsv4 {{ domain }} | awk '{print $1}' | paste -sd ',' -"
+      register: dns_resolve
+      delegate_to: localhost
+      changed_when: false
+      failed_when: false
+      run_once: true
+
+    - name: Set resolved and expected IP facts
       set_fact:
-        resolved_ips: "{{ lookup('community.general.dig', query_name, 'qtype=A') | default('') }}"
+        resolved_ips: "{{ dns_resolve.stdout | default('') }}"
         expected_ip: "{{ ansible_default_ipv4.address | default(ansible_host) }}"
       run_once: true
 
@@ -344,8 +350,8 @@
   pre_tasks:
     - name: DNS wait (seconds) before HTTPS
       pause:
-        seconds: "{{ dns_wait_seconds | int }}"
-      when: dns_wait_mode == 'seconds' and (dns_wait_seconds | int) > 0
+        seconds: "{{ dns_wait_seconds | default(120) | int }}"
+      when: (dns_wait_mode | default('prompt')) == 'seconds' and (dns_wait_seconds | default(0) | int) > 0
       run_once: true
 
     - name: DNS wait (prompt) before HTTPS
@@ -353,14 +359,20 @@
         prompt: |
           Ensure DNS A record for {{ domain }} points to {{ ansible_default_ipv4.address | default(ansible_host) }} (Cloudflare: set 'DNS only' until first cert).
           Press Enter to continue with HTTPS enablement (Ctrl-C to abort)...
-      when: dns_wait_mode == 'prompt'
+      when: (dns_wait_mode | default('prompt')) == 'prompt'
       run_once: true
 
-    - name: Optional DNS precheck (requires community.general.dig)
-      vars:
-        query_name: "{{ domain }}"
+    - name: Resolve domain to IPs on control machine (for precheck)
+      ansible.builtin.command: bash -lc "getent ahostsv4 {{ domain }} | awk '{print $1}' | paste -sd ',' -"
+      register: dns_resolve
+      delegate_to: localhost
+      changed_when: false
+      failed_when: false
+      run_once: true
+
+    - name: Set resolved and expected IP facts
       set_fact:
-        resolved_ips: "{{ lookup('community.general.dig', query_name, 'qtype=A') | default('') }}"
+        resolved_ips: "{{ dns_resolve.stdout | default('') }}"
         expected_ip: "{{ ansible_default_ipv4.address | default(ansible_host) }}"
       run_once: true
 
