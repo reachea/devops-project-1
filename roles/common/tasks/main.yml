@@ -1,3 +1,203 @@
+---
+# roles/common/tasks/main.yml
+# Common baseline for fresh Ubuntu 22.04 droplets on DigitalOcean.
+# Handles: cloud-init wait, apt lock handling, updates, Docker (official repo),
+# docker compose v2, Portainer, Nginx, and SonarQube-friendly sysctl.
+
+############################
+# First-boot / apt safety  #
+############################
+- name: Wait for cloud-init to finish (if present)
+  ansible.builtin.shell: |
+    if command -v cloud-init >/dev/null 2>&1; then
+      cloud-init status --wait
+    else
+      test -f /var/lib/cloud/instance/boot-finished || true
+    fi
+  register: cloudinit_status
+  changed_when: false
+  failed_when: false
+  tags: [init, apt]
+
+- name: Wait until no APT/Dpkg locks are held
+  ansible.builtin.shell: |
+    set -e
+    for i in {1..60}; do
+      if fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock >/dev/null 2>&1; then
+        sleep 5
+      elif pgrep -ax "apt|apt-get|unattended-upgrade|dpkg" >/dev/null 2>&1; then
+        sleep 5
+      else
+        exit 0
+      fi
+    done
+    echo "APT locks still present" >&2
+    exit 1
+  register: apt_locks
+  changed_when: false
+  tags: [init, apt]
+
+############################
+# Update & upgrade         #
+############################
+- name: Update apt cache
+  ansible.builtin.apt:
+    update_cache: yes
+    cache_valid_time: 3600
+  register: apt_update
+  retries: 5
+  delay: 6
+  until: apt_update is succeeded
+  tags: [apt]
+
+- name: Dist upgrade
+  ansible.builtin.apt:
+    upgrade: dist
+  register: apt_upgrade
+  retries: 5
+  delay: 6
+  until: apt_upgrade is succeeded
+  tags: [apt]
+
+#############################################
+# Docker official repository (stable)       #
+#############################################
+- name: Ensure required apt tooling is present (for Docker repo)
+  ansible.builtin.apt:
+    name:
+      - ca-certificates
+      - curl
+      - gnupg
+      - lsb-release
+    state: present
+    update_cache: yes
+  tags: [docker_repo]
+
+- name: Ensure facts are present (for arch & codename)
+  ansible.builtin.setup:
+  tags: [docker_repo]
+
+- name: Compute Debian arch and Ubuntu codename
+  ansible.builtin.set_fact:
+    deb_arch: >-
+      {{ 'amd64' if ansible_facts.architecture in ['x86_64','amd64']
+         else ('arm64' if ansible_facts.architecture in ['aarch64','arm64']
+         else ansible_facts.architecture) }}
+    ubuntu_codename: "{{ ansible_facts.lsb.codename | default('jammy') }}"
+  tags: [docker_repo]
+
+- name: Create keyrings directory for apt
+  ansible.builtin.file:
+    path: /etc/apt/keyrings
+    state: directory
+    mode: "0755"
+  tags: [docker_repo]
+
+- name: Download Docker GPG key (raw)
+  ansible.builtin.get_url:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    dest: /etc/apt/keyrings/docker.gpg.raw
+    mode: "0644"
+  tags: [docker_repo]
+
+- name: Convert Docker GPG key to keyring format
+  ansible.builtin.shell: |
+    gpg --dearmor < /etc/apt/keyrings/docker.gpg.raw > /etc/apt/keyrings/docker.gpg
+    chmod a+r /etc/apt/keyrings/docker.gpg
+  args:
+    creates: /etc/apt/keyrings/docker.gpg
+  tags: [docker_repo]
+
+- name: Add Docker apt repository (stable)
+  ansible.builtin.apt_repository:
+    repo: "deb [arch={{ deb_arch }} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu {{ ubuntu_codename }} stable"
+    filename: docker
+    state: present
+  tags: [docker_repo]
+
+- name: apt update after adding Docker repo
+  ansible.builtin.apt:
+    update_cache: yes
+  tags: [docker_repo]
+
+#############################################
+# Base packages (no docker here)            #
+#############################################
+- name: Install base packages
+  ansible.builtin.apt:
+    name:
+      - git
+      - curl
+      - ca-certificates
+      - gnupg
+      - lsb-release
+      - zsh
+      - nginx
+      - certbot
+      - python3-certbot-nginx
+      - python3-pip
+    state: present
+  register: base_pkgs
+  retries: 5
+  delay: 6
+  until: base_pkgs is succeeded
+  tags: [packages]
+
+#############################################
+# Docker engine + Compose v2 from Docker    #
+#############################################
+- name: Remove distro docker.io if present (prefer docker-ce)
+  ansible.builtin.apt:
+    name: docker.io
+    state: absent
+  ignore_errors: true
+  tags: [docker]
+
+- name: Install Docker CE and plugins (Compose v2 + Buildx)
+  ansible.builtin.apt:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-buildx-plugin
+      - docker-compose-plugin
+    state: present
+  register: docker_pkgs
+  retries: 5
+  delay: 6
+  until: docker_pkgs is succeeded
+  tags: [docker]
+
+- name: Enable and start Docker
+  ansible.builtin.systemd:
+    name: docker
+    enabled: true
+    state: started
+  tags: [docker]
+
+# Optional: enable non-root docker usage (set docker_user at host/group level)
+# - name: Add {{ docker_user | default('root') }} to docker group
+#   ansible.builtin.user:
+#     name: "{{ docker_user }}"
+#     groups: docker
+#     append: yes
+#   when: docker_user is defined and docker_user != 'root'
+#   tags: [docker]
+
+#############################################
+# Oh My Zsh (non-interactive)               #
+#############################################
+- name: Install Oh My Zsh for root (non-interactive)
+  ansible.builtin.shell: |
+    export RUNZSH=no
+    export CHSH=no
+    if [ ! -d /root/.oh-my-zsh ]; then
+      sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" || true
+    fi
+  args:
+    creates: /root/.oh-my-zsh
+  tags: [shell]
+
 # -----------------------------
 # Portainer CE (Docker UI) on 9443 (avoid SonarQube 9000 conflict)
 # -----------------------------
@@ -30,3 +230,24 @@
   changed_when: false
   failed_when: false
   tags: [portainer]
+
+#############################################
+# Nginx availability (for domain role)      #
+#############################################
+- name: Ensure Nginx is started
+  ansible.builtin.service:
+    name: nginx
+    state: started
+    enabled: true
+  tags: [nginx]
+
+#############################################
+# SonarQube-friendly sysctl                 #
+#############################################
+- name: Ensure vm.max_map_count is set for Elasticsearch-based apps
+  ansible.builtin.sysctl:
+    name: vm.max_map_count
+    value: "262144"
+    state: present
+    reload: yes
+  tags: [sysctl]
