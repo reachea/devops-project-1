@@ -7,8 +7,10 @@
     - group_vars/all.yml
 
   vars:
-    # Set to true if your DNS zone is hosted on DigitalOcean and you want A records created automatically.
-    manage_dns: false
+    # ====== TUNABLE WAITS ======
+    post_create_wait_seconds: 60 # extra sleep after droplets are created (0 to skip)
+    dns_wait_mode: "prompt" # "prompt" or "seconds"
+    dns_wait_seconds: 120 # used only when dns_wait_mode == "seconds"
 
   tasks:
     - name: Sanity check required vars
@@ -69,7 +71,7 @@
       register: nexus
 
     # -------------------------
-    # Fetch droplet info (version-proof) and derive public IPs
+    # Query droplets & compute IPs (version-proof)
     # -------------------------
     - name: Get Jenkins droplet info
       community.digitalocean.digital_ocean_droplet_info:
@@ -89,7 +91,6 @@
         name: "{{ nexus_name }}"
       register: nexus_info
 
-    # Normalize objects (some versions use .data[], others .droplets[])
     - name: Normalize droplet objects
       set_fact:
         jenkins_obj: >-
@@ -147,7 +148,7 @@
           - jenkins_ip | length > 0
           - sonarqube_ip | length > 0
           - nexus_ip | length > 0
-        fail_msg: "Could not determine one or more public IPs. Run with -vvv or add a debug to inspect *_info payloads."
+        fail_msg: "Could not determine one or more public IPs."
 
     - name: Show created IPs
       debug:
@@ -186,55 +187,192 @@
         service_port: 8081
         domain: "{{ domains.nexus }}"
 
+    # -------------------------
+    # Post-create wait knobs
+    # -------------------------
+    - name: Optional post-create sleep
+      pause:
+        seconds: "{{ post_create_wait_seconds | int }}"
+      when: (post_create_wait_seconds | int) > 0
+
 # -----------------------------------------
-# Configure common packages on all servers
+# Configure base packages (common) on all servers
 # -----------------------------------------
 - name: Configure base packages (common) on all servers
   hosts: created
   become: true
-  gather_facts: true
-  tasks:
-    - name: Wait for SSH to be ready
+  gather_facts: false
+  serial: 1 # avoid apt lock contention
+  pre_tasks:
+    - name: Wait for SSH to be reachable (port 22)
       ansible.builtin.wait_for:
         host: "{{ ansible_host }}"
         port: 22
         delay: 5
-        timeout: 300
+        timeout: 900
       delegate_to: localhost
+
+    - name: Wait for cloud-init to finish (if present)
+      ansible.builtin.shell: |
+        if command -v cloud-init >/dev/null 2>&1; then
+          cloud-init status --wait
+        else
+          test -f /var/lib/cloud/instance/boot-finished || true
+        fi
+      register: cloudinit_status
+      changed_when: false
+      failed_when: false
+
+    - name: Wait until no APT/Dpkg locks are held
+      ansible.builtin.shell: |
+        set -e
+        for i in {1..60}; do
+          if fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock >/dev/null 2>&1; then
+            sleep 5
+          elif pgrep -ax "apt|apt-get|unattended-upgrade|dpkg" >/dev/null 2>&1; then
+            sleep 5
+          else
+            exit 0
+          fi
+        done
+        echo "APT locks still present" >&2
+        exit 1
+      register: apt_locks
+      changed_when: false
+
+    - name: Gather facts
+      ansible.builtin.setup:
+
   roles:
     - role: common
 
 # -----------------------------------------
-# Jenkins node
+# Jenkins node (with DNS wait before HTTPS)
 # -----------------------------------------
 - name: Setup Jenkins
   hosts: jenkins_group
   become: true
   gather_facts: true
+  pre_tasks:
+    - name: DNS wait (seconds) before HTTPS
+      pause:
+        seconds: "{{ dns_wait_seconds | int }}"
+      when: dns_wait_mode == 'seconds' and (dns_wait_seconds | int) > 0
+      run_once: true
+
+    - name: DNS wait (prompt) before HTTPS
+      pause:
+        prompt: |
+          Ensure DNS A record for {{ domain }} points to {{ ansible_default_ipv4.address | default(ansible_host) }} (Cloudflare: set 'DNS only' until first cert).
+          Press Enter to continue with HTTPS enablement (Ctrl-C to abort)...
+      when: dns_wait_mode == 'prompt'
+      run_once: true
+
+    - name: Optional DNS precheck (requires community.general.dig)
+      vars:
+        query_name: "{{ domain }}"
+      set_fact:
+        resolved_ips: "{{ lookup('community.general.dig', query_name, 'qtype=A') | default('') }}"
+        expected_ip: "{{ ansible_default_ipv4.address | default(ansible_host) }}"
+      run_once: true
+
+    - name: Fail if DNS does not resolve to this host (bypass with -e skip_dns_check=true)
+      ansible.builtin.fail:
+        msg: >-
+          DNS for {{ domain }} is not pointing here yet (resolved: {{ resolved_ips }}, expected: {{ expected_ip }}).
+          Update DNS at Cloudflare, wait, and re-run. Or bypass check with -e skip_dns_check=true
+      when:
+        - (skip_dns_check | default(false)) | bool == false
+        - not (resolved_ips is search(expected_ip))
+      run_once: true
   roles:
     - role: jenkins
     - role: domain
   tags: [jenkins]
 
 # -----------------------------------------
-# SonarQube node
+# SonarQube node (with DNS wait before HTTPS)
 # -----------------------------------------
 - name: Setup SonarQube
   hosts: sonarqube_group
   become: true
   gather_facts: true
+  pre_tasks:
+    - name: DNS wait (seconds) before HTTPS
+      pause:
+        seconds: "{{ dns_wait_seconds | int }}"
+      when: dns_wait_mode == 'seconds' and (dns_wait_seconds | int) > 0
+      run_once: true
+
+    - name: DNS wait (prompt) before HTTPS
+      pause:
+        prompt: |
+          Ensure DNS A record for {{ domain }} points to {{ ansible_default_ipv4.address | default(ansible_host) }} (Cloudflare: set 'DNS only' until first cert).
+          Press Enter to continue with HTTPS enablement (Ctrl-C to abort)...
+      when: dns_wait_mode == 'prompt'
+      run_once: true
+
+    - name: Optional DNS precheck (requires community.general.dig)
+      vars:
+        query_name: "{{ domain }}"
+      set_fact:
+        resolved_ips: "{{ lookup('community.general.dig', query_name, 'qtype=A') | default('') }}"
+        expected_ip: "{{ ansible_default_ipv4.address | default(ansible_host) }}"
+      run_once: true
+
+    - name: Fail if DNS does not resolve to this host (bypass with -e skip_dns_check=true)
+      ansible.builtin.fail:
+        msg: >-
+          DNS for {{ domain }} is not pointing here yet (resolved: {{ resolved_ips }}, expected: {{ expected_ip }}).
+          Update DNS at Cloudflare, wait, and re-run. Or bypass check with -e skip_dns_check=true
+      when:
+        - (skip_dns_check | default(false)) | bool == false
+        - not (resolved_ips is search(expected_ip))
+      run_once: true
   roles:
     - role: sonarqube
     - role: domain
   tags: [sonarqube]
 
 # -----------------------------------------
-# Nexus node
+# Nexus node (with DNS wait before HTTPS)
 # -----------------------------------------
 - name: Setup Nexus
   hosts: nexus_group
   become: true
   gather_facts: true
+  pre_tasks:
+    - name: DNS wait (seconds) before HTTPS
+      pause:
+        seconds: "{{ dns_wait_seconds | int }}"
+      when: dns_wait_mode == 'seconds' and (dns_wait_seconds | int) > 0
+      run_once: true
+
+    - name: DNS wait (prompt) before HTTPS
+      pause:
+        prompt: |
+          Ensure DNS A record for {{ domain }} points to {{ ansible_default_ipv4.address | default(ansible_host) }} (Cloudflare: set 'DNS only' until first cert).
+          Press Enter to continue with HTTPS enablement (Ctrl-C to abort)...
+      when: dns_wait_mode == 'prompt'
+      run_once: true
+
+    - name: Optional DNS precheck (requires community.general.dig)
+      vars:
+        query_name: "{{ domain }}"
+      set_fact:
+        resolved_ips: "{{ lookup('community.general.dig', query_name, 'qtype=A') | default('') }}"
+        expected_ip: "{{ ansible_default_ipv4.address | default(ansible_host) }}"
+      run_once: true
+
+    - name: Fail if DNS does not resolve to this host (bypass with -e skip_dns_check=true)
+      ansible.builtin.fail:
+        msg: >-
+          DNS for {{ domain }} is not pointing here yet (resolved: {{ resolved_ips }}, expected: {{ expected_ip }}).
+          Update DNS at Cloudflare, wait, and re-run. Or bypass check with -e skip_dns_check=true
+      when:
+        - (skip_dns_check | default(false)) | bool == false
+        - not (resolved_ips is search(expected_ip))
+      run_once: true
   roles:
     - role: nexus
     - role: domain
