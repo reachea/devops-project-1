@@ -1,12 +1,12 @@
 ---
 # roles/nexus/tasks/main.yml
-
-- name: Ensure python3-docker (SDK) is installed for docker modules
-  ansible.builtin.apt:
-    name: python3-docker
-    state: present
-    update_cache: yes
-  tags: [nexus]
+# Nexus 3 via Docker, using shell/command (no community.docker dependency).
+# Ensures:
+# - docker running
+# - named volume nexus_data exists and owned by UID 200
+# - container runs with NEXUS_DATA=/nexus-data and sane JVM flags for small droplets
+# - waits until service is up on 8081
+# - optional nginx HTTP site to proxy before HTTPS role
 
 - name: Ensure Docker service is running
   ansible.builtin.systemd:
@@ -15,50 +15,79 @@
     enabled: true
   tags: [nexus]
 
-- name: Ensure Nexus named volume exists
-  community.docker.docker_volume:
-    name: nexus_data
-    state: present
+# ---- Volume ensure (idempotent) ----
+- name: Check if nexus_data volume exists
+  ansible.builtin.shell: docker volume inspect nexus_data >/dev/null 2>&1
+  register: vol_check
+  changed_when: false
+  failed_when: false
   tags: [nexus]
 
-# Initialize ownership and required dirs inside the volume for UID 200
-- name: Initialize nexus_data (mkdir & chown to 200:200)
-  community.docker.docker_container:
-    name: nexus-init
-    image: alpine:3
-    auto_remove: true
-    detach: false
-    volumes:
-      - nexus_data:/nexus-data
-    command: >
-      sh -c "mkdir -p /nexus-data/{etc,log,tmp,javaprefs} &&
-             chown -R 200:200 /nexus-data"
+- name: Create nexus_data volume if missing
+  ansible.builtin.shell: docker volume create nexus_data
+  when: vol_check.rc != 0
+  register: vol_create
+  changed_when: "'nexus_data' in (vol_create.stdout | default(''))"
+  tags: [nexus]
+
+# ---- Initialize volume permissions for UID 200 ----
+- name: Initialize nexus_data (mkdir & chown to UID 200)
+  ansible.builtin.shell: |
+    docker run --rm -v nexus_data:/nexus-data alpine:3 \
+      sh -c "mkdir -p /nexus-data/{etc,log,tmp,javaprefs} && chown -R 200:200 /nexus-data"
   register: nx_init
-  changed_when: "'mkdir' in nx_init.stdout or 'chown' in nx_init.stdout"
+  changed_when: true
+  failed_when: false
   tags: [nexus]
 
-# Run Nexus 3 (explicit NEXUS_DATA and modest JVM for 2GB droplets)
-- name: Run Nexus 3 container
-  community.docker.docker_container:
-    name: nexus
-    image: sonatype/nexus3:latest
-    pull: true
-    restart_policy: unless-stopped
-    state: started
-    published_ports:
-      - "8081:8081"
-    volumes:
-      - "nexus_data:/nexus-data"
-    env:
-      NEXUS_DATA: /nexus-data
-      INSTALL4J_ADD_VM_PARAMS: >-
-        -Xms768m -Xmx1024m
-        -XX:MaxDirectMemorySize=1024m
-        -Djava.util.prefs.userRoot=/nexus-data/javaprefs
+# ---- Remove conflicting container if exists (wrong config) ----
+- name: Check if nexus container exists
+  ansible.builtin.shell: docker ps -a --format '{{.Names}}' | grep -x nexus
+  register: nx_exists
+  changed_when: false
+  failed_when: false
   tags: [nexus]
 
-# Wait for TCP port to open
-- name: Wait for container port 8081 to open
+- name: Remove existing nexus container (to enforce config)
+  ansible.builtin.shell: docker rm -f nexus
+  when: nx_exists.rc == 0
+  changed_when: true
+  failed_when: false
+  tags: [nexus]
+
+# ---- Run Nexus ----
+- name: Pull latest Nexus 3 image
+  ansible.builtin.shell: docker pull sonatype/nexus3:latest
+  register: pull_out
+  changed_when: "'Downloaded newer image' in (pull_out.stdout | default(''))"
+  failed_when: false
+  tags: [nexus]
+
+- name: Run Nexus container (idempotent start)
+  ansible.builtin.shell: |
+    docker run -d --name nexus --restart=unless-stopped \
+      -e NEXUS_DATA=/nexus-data \
+      -e INSTALL4J_ADD_VM_PARAMS="-Xms768m -Xmx1024m -XX:MaxDirectMemorySize=1024m -Djava.util.prefs.userRoot=/nexus-data/javaprefs" \
+      -p 8081:8081 \
+      -v nexus_data:/nexus-data \
+      sonatype/nexus3:latest
+  register: run_out
+  changed_when: run_out.rc == 0
+  failed_when: run_out.rc != 0 and ('Conflict' not in run_out.stderr | default(''))
+  tags: [nexus]
+
+# If container already running, ensure it's up
+- name: Ensure nexus container is running
+  ansible.builtin.shell: |
+    if ! docker ps --format '{{.Names}}' | grep -x nexus >/dev/null 2>&1; then
+      exit 1
+    fi
+  register: nx_running
+  changed_when: false
+  tags: [nexus]
+
+# ---- Waits ----
+- name: Wait for port 8081 to open
   ansible.builtin.wait_for:
     host: 127.0.0.1
     port: 8081
@@ -66,8 +95,7 @@
     timeout: 600
   tags: [nexus]
 
-# Wait until the app is actually ready (status endpoint returns 200)
-- name: Wait for Nexus status endpoint to return 200
+- name: Wait until Nexus status endpoint returns 200
   ansible.builtin.shell: |
     for i in $(seq 1 60); do
       code=$(curl -s -o /tmp/nx.json -w '%{http_code}' http://127.0.0.1:8081/service/rest/v1/status || true)
@@ -79,9 +107,36 @@
   changed_when: false
   tags: [nexus]
 
-- name: Show Nexus status (debug)
+- name: Show Nexus status JSON (debug)
   ansible.builtin.shell: cat /tmp/nx.json || true
   register: nx_status_body
   changed_when: false
   failed_when: false
+  tags: [nexus]
+
+# ---- Optional: HTTP Nginx site (TLS added later by domain role) ----
+- name: Drop Nginx site for Nexus (HTTP proxy)
+  ansible.builtin.template:
+    src: nexus_nginx_http.conf.j2
+    dest: /etc/nginx/sites-available/nexus.conf
+  tags: [nexus]
+
+- name: Enable Nexus Nginx site (HTTP)
+  ansible.builtin.file:
+    src: /etc/nginx/sites-available/nexus.conf
+    dest: /etc/nginx/sites-enabled/nexus.conf
+    state: link
+    force: true
+  tags: [nexus]
+
+- name: Test Nginx config
+  ansible.builtin.shell: nginx -t
+  register: nginx_test
+  changed_when: false
+  tags: [nexus]
+
+- name: Reload Nginx
+  ansible.builtin.service:
+    name: nginx
+    state: reloaded
   tags: [nexus]
